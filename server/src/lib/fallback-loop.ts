@@ -206,6 +206,43 @@ export function getFallbackTimeBudgetMs(): number {
   return DEFAULT_FALLBACK_TIME_BUDGET_MS;
 }
 
+// ── Stall failover ──────────────────────────────────────────────────────────
+// The wall-clock budget above cannot bound a request: attempt 0 and the first
+// retry are exempt from it (#751), and when it does cancel a stalled attempt
+// the request ENDS (timedOut exhaustion). Two silent routes in a row therefore
+// cost two full upstream timeouts, and a healthy third route never gets asked.
+//
+// A stall timeout is the per-attempt half of the answer. It runs on EVERY
+// attempt, including the first; when an attempt has produced nothing by then it
+// is abandoned and the ladder moves on to the next candidate, exactly as it
+// would after a retryable upstream error. Nothing was sent to the client, so
+// the failover is invisible.
+//
+// Two values, because "nothing yet" means different things. A streaming
+// attempt shows its first token, so its timeout is a time-to-first-byte. A
+// non-streaming attempt is silent until the whole answer exists, so its
+// timeout caps the entire generation and must be set far more generously.
+// Both default to 0 (off): an install that sets neither behaves as before.
+export const ATTEMPT_STALL_TIMEOUT_SETTING = 'attempt_stall_timeout_ms';
+export const ATTEMPT_STALL_TIMEOUT_NONSTREAM_SETTING = 'attempt_stall_timeout_nonstream_ms';
+
+/** The stall timeout for one attempt, in ms; 0 = off. Setting wins, then env. */
+export function getAttemptStallTimeoutMs(streaming: boolean): number {
+  const key = streaming ? ATTEMPT_STALL_TIMEOUT_SETTING : ATTEMPT_STALL_TIMEOUT_NONSTREAM_SETTING;
+  let stored: string | undefined;
+  try {
+    stored = getSetting(key);
+  } catch {
+    stored = undefined; // DB not ready — never throw on the proxy hot path
+  }
+  for (const raw of [stored, process.env[key.toUpperCase()]]) {
+    if (raw === undefined || raw.trim() === '') continue;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return 0;
+}
+
 // Mutable per-request skip state threaded through the loop and mutated by
 // recordRetryableFailure / recordAuthFailure. skipKeys entries are
 // "platform:modelId:keyId"; skipModels holds model_db_ids ruled out for the
@@ -1308,6 +1345,13 @@ export interface DispatchContext {
    * call, including when hedging is not armed at all. See FallbackHooks.dispatch.
    */
   disarmHedge(): void;
+  /**
+   * The upstream produced its first output for this attempt. Cancels the stall
+   * timeout only: the attempt is alive, though nothing may be committed to the
+   * client yet (a reasoning-only prefix is held back), so the time budget stays
+   * armed. Idempotent; a no-op when stall failover is off.
+   */
+  noteFirstByte(): void;
 }
 
 // Per-request exhaustion metadata handed to the exhaustion hooks, so each
@@ -1353,6 +1397,14 @@ export interface FallbackHooks {
   // model+key only when that attempt ate the whole budget by itself (see the
   // isHedgeAbortError branch below). Absent = pre-v2 behavior.
   abortInFlight?: () => void;
+  // Stall failover (see getAttemptStallTimeoutMs). abortInFlight cancels the
+  // request's composed signal, and a signal stays aborted: the surface must
+  // swap in a fresh controller here before the next attempt can use it. The
+  // loop arms the stall timeout only when BOTH hooks are present, so a surface
+  // that has not been taught to renew its signal keeps the old behavior.
+  renewInFlightAbort?: () => void;
+  // Whether this request streams, which picks the stall timeout that applies.
+  streaming?: boolean;
   // Skip state; recordRetryableFailure / recordAuthFailure (called by the loop)
   // mutate it, and the surface's route() reads it to exclude failed keys/models.
   state: FallbackState;
@@ -1506,6 +1558,10 @@ async function runFallbackLoopAttempts(hooks: FallbackHooks, trace: RequestTrace
     }
 
     let hedgeTimer: NodeJS.Timeout | undefined;
+    let stallTimer: NodeJS.Timeout | undefined;
+    // Set by the stall timer when IT aborted this attempt, so the catch below
+    // can tell a stall (fail over) from the budget hedge (the request is over).
+    let stalled = false;
     try {
     // Select the endpoint before checking the budget: a slow endpoint may
     // still have time even after the base budget has expired. Recompute from
@@ -1562,12 +1618,30 @@ async function runFallbackLoopAttempts(hooks: FallbackHooks, trace: RequestTrace
     // because past that point cancelling would truncate a healthy response and
     // buy nothing: a committed stream can no longer fail over anyway. Slow is
     // not the same as stalled, and only stalled is worth killing.
+    const disarmStall = () => {
+      if (stallTimer) {
+        clearTimeout(stallTimer);
+        stallTimer = undefined;
+      }
+    };
     const disarmHedge = () => {
       if (hedgeTimer) {
         clearTimeout(hedgeTimer);
         hedgeTimer = undefined;
       }
+      // Committed means alive: the stall timeout has nothing left to judge.
+      disarmStall();
     };
+    const stallMs = hooks.abortInFlight && hooks.renewInFlightAbort
+      ? getAttemptStallTimeoutMs(hooks.streaming === true)
+      : 0;
+    if (stallMs > 0) {
+      stallTimer = setTimeout(() => {
+        stalled = true;
+        console.log(`[FallbackLoop] no output from ${route.platform}/${route.modelId} after ${stallMs}ms — abandoning the attempt and failing over`);
+        hooks.abortInFlight?.();
+      }, stallMs);
+    }
     if (attempt > 1 && budgetMs > 0 && hooks.abortInFlight) {
       const remaining = budgetMs - (Date.now() - startedAt);
       if (remaining > 0) {
@@ -1584,7 +1658,7 @@ async function runFallbackLoopAttempts(hooks: FallbackHooks, trace: RequestTrace
       // otherwise the global proxy / direct path applies as before. The URL
       // arrives already decrypted on the route (services/router.ts), so an
       // attempt costs nothing extra — no query, no decrypt.
-      outcome = await withKeyProxy(route.proxyUrl, () => hooks.dispatch(route, attempt, { disarmHedge }));
+      outcome = await withKeyProxy(route.proxyUrl, () => hooks.dispatch(route, attempt, { disarmHedge, noteFirstByte: disarmStall }));
     } catch (err: any) {
       // Client-caused abort: the composed fetch signal fired because OUR
       // client hung up mid-attempt (see newClientAbortError). Not a
@@ -1624,6 +1698,27 @@ async function runFallbackLoopAttempts(hooks: FallbackHooks, trace: RequestTrace
       // rate-limit signal, so cooldownDecisionForError keeps it light) plus the
       // gradual model-level sink, both of which decay on their own if the route
       // recovers.
+      // Stall failover: OUR stall timer canceled this attempt, not the budget.
+      // The attempt sent the client nothing, so treat it as the retryable
+      // upstream failure it is: bench the route lightly (a route that goes
+      // silent would otherwise stay at the head of the order and stall the next
+      // request too), give the surface a live signal again, and move on.
+      if (stalled && isHedgeAbortError(err)) {
+        const stallErr = Object.assign(
+          new Error(`${route.platform}/${route.modelId} timed out: no output within ${stallMs}ms (stall failover)`),
+          // A sibling key of the same model would wait on the same silent
+          // upstream: rule the model out for the rest of this request.
+          { status: 504, skipModelForRequest: true },
+        );
+        hooks.renewInFlightAbort?.();
+        hooks.logFailure(route, stallErr, attempt);
+        recordRetryableFailure(route, stallErr, hooks.state);
+        attempts.push({ platform: route.platform, modelId: route.modelId, keyOrdinal: keyOrdinal(route), errorClass: 'timeout' });
+        traceAttempt('timeout', stallErr);
+        lastError = stallErr;
+        if (stopIfBreakerTripped()) return;
+        continue;
+      }
       if (isHedgeAbortError(err)) {
         const elapsedMs = Date.now() - startedAt;
         const attemptElapsedMs = Date.now() - attemptStartedAt;
@@ -1717,6 +1812,7 @@ async function runFallbackLoopAttempts(hooks: FallbackHooks, trace: RequestTrace
     return;
     } finally {
       if (hedgeTimer) clearTimeout(hedgeTimer);
+      if (stallTimer) clearTimeout(stallTimer);
       route.release?.();
     }
   }
