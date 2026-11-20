@@ -245,6 +245,52 @@ export function retireCatalogModelUpstream(
 }
 
 /**
+ * SQL predicate, true for a `models` row (aliased `alias`) that is retired
+ * upstream RIGHT NOW: it carries an `upstream_eol` tombstone and its chain row
+ * is still off. An operator who disagrees flips the chain switch back on, which
+ * makes this false again without touching the tombstone.
+ *
+ * The retirement switches off auto-routing only, so without this an explicit
+ * request for the model id still resolved, was sent upstream, and came back as
+ * the same 404/410 every time, while /v1/models went on listing the model as
+ * available. Listings and by-name resolution share this one definition.
+ */
+export function upstreamRetiredSql(alias = 'm'): string {
+  return `(EXISTS (
+      SELECT 1 FROM catalog_model_tombstones rt
+      WHERE rt.kind = 'chat' AND rt.platform = ${alias}.platform
+        AND rt.model_id = ${alias}.model_id AND rt.source = 'upstream_eol'
+    ) AND COALESCE((SELECT rfc.enabled FROM fallback_config rfc WHERE rfc.model_db_id = ${alias}.id), 1) = 0)`;
+}
+
+/**
+ * The enabled model row a client-supplied model id resolves to, or undefined.
+ * A model that is retired upstream does not resolve: the request would only
+ * spend a round trip on the provider's 404/410.
+ */
+export function findServableModelByModelId(db: Db, modelId: string): { id: number } | undefined {
+  return db.prepare(
+    `SELECT m.id FROM models m WHERE m.model_id = ? AND m.enabled = 1 AND NOT ${upstreamRetiredSql('m')}`,
+  ).get(modelId) as { id: number } | undefined;
+}
+
+/** The wording each reason takes after "Model '<id>' " in a client error. */
+export const UNSERVABLE_REASON_TEXT: Record<'retired' | 'disabled' | 'unknown', string> = {
+  retired: 'was retired by its provider (it answered 404/410 end of life)',
+  disabled: 'is disabled',
+  unknown: 'is not in the catalog',
+};
+
+/** Why a model id that did not resolve is unavailable, for the 404 message. */
+export function unservableModelReason(db: Db, modelId: string): 'retired' | 'disabled' | 'unknown' {
+  const row = db.prepare(
+    `SELECT m.enabled AS enabled, ${upstreamRetiredSql('m')} AS retired FROM models m WHERE m.model_id = ? ORDER BY m.enabled DESC LIMIT 1`,
+  ).get(modelId) as { enabled: number; retired: number } | undefined;
+  if (!row) return 'unknown';
+  return row.enabled === 1 && row.retired === 1 ? 'retired' : 'disabled';
+}
+
+/**
  * Lift an upstream retirement: a catalog that still lists the model — and lists
  * it enabled — is newer and better evidence than one provider's 404. Returns
  * true when a retirement was actually lifted.

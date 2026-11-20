@@ -14,6 +14,7 @@ import { retryAfterSeconds } from '../lib/retry-hint.js';
 import { runImageGeneration, runVideoGeneration, runSpeech, runTranscription, MediaError, MAX_TRANSCRIPTION_BYTES } from '../services/media.js';
 import multer from 'multer';
 import { getDb } from '../db/index.js';
+import { findServableModelByModelId, unservableModelReason, upstreamRetiredSql, UNSERVABLE_REASON_TEXT } from '../services/model-state.js';
 import { resolveAuth, prependSystemPrompt, type ResolvedAuth } from '../lib/system-prompt.js';
 import { contentToString, estimateInputTokens, messageHasImage, normalizeOutboundContent, sanitizeResponse } from '../lib/content.js';
 import { routeOutputBudget } from '../lib/output-cap.js';
@@ -549,7 +550,7 @@ function buildCatalogEntries(filters: { onlyAvailable?: boolean; executionStatus
       context_length: m.contextWindow,
       // Non-standard but additive: OpenAI clients ignore unknown fields.
       available: m.available === 1,
-      unavailable_reason: m.available === 1 ? null : (m.enabled === 1 ? 'no_key' : 'disabled'),
+      unavailable_reason: m.available === 1 ? null : (m.retired ? 'retired' : m.enabled === 1 ? 'no_key' : 'disabled'),
       // Machine-readable dynamic status: 'ready' | 'needsKey' | 'exhausted'
       // (see services/model-listing.ts). Agents can filter with
       // ?execution_status=ready and route around exhausted models.
@@ -1509,7 +1510,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
       groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
       if (groupChain.length === 0) {
         const placeholders = members.map(() => '?').join(',');
-        const anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
+        const anyEnabled = db.prepare(`SELECT 1 FROM models m WHERE m.id IN (${placeholders}) AND m.enabled = 1 AND NOT ${upstreamRetiredSql('m')} LIMIT 1`).get(...members);
         // Honest statuses: a model whose providers exist but have no usable key
         // is a server-side configuration gap (503), not a client mistake; a
         // disabled/unknown model is a 404 model_not_found (OpenAI semantics).
@@ -1535,12 +1536,11 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         return;
       }
     } else {
-      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+      const enabled = findServableModelByModelId(db, requestedModel);
       if (enabled) {
         preferredModel = enabled.id;
       } else {
-        const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
-        const reason = disabled ? 'is disabled' : 'is not in the catalog';
+        const reason = UNSERVABLE_REASON_TEXT[unservableModelReason(db, requestedModel)];
         res.status(404).json({
           error: {
             message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
@@ -2493,7 +2493,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // (chain-disabled / no key) — the latter is a server-side
         // configuration gap, so it renders an honest 503.
         const placeholders = members.map(() => '?').join(',');
-        const anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
+        const anyEnabled = db.prepare(`SELECT 1 FROM models m WHERE m.id IN (${placeholders}) AND m.enabled = 1 AND NOT ${upstreamRetiredSql('m')} LIMIT 1`).get(...members);
         if (anyEnabled) {
           res.status(503).json({
             error: {
@@ -2523,12 +2523,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       preferredModel = (sticky != null && groupChain.some(r => r.model_db_id === sticky)) ? sticky : undefined;
     } else {
       // Unify OFF, or an id that isn't in the catalog: legacy single-row pin.
-      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+      const enabled = findServableModelByModelId(db, requestedModel);
       if (enabled) {
         preferredModel = enabled.id;
       } else {
-        const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
-        const reason = disabled ? 'is disabled' : 'is not in the catalog';
+        const reason = UNSERVABLE_REASON_TEXT[unservableModelReason(db, requestedModel)];
         res.status(404).json({
           error: {
             message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,

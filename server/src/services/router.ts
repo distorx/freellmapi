@@ -31,7 +31,7 @@ import { TIMEOUT_ERROR_MARKERS, isProviderMomentFailure } from '../lib/error-cla
 import { checkMonthlyBudget, reserveMonthlyBudget } from './key-budget.js';
 import { cloudflareNeuronsAvailable } from './cloudflare-neurons.js';
 import { applyModelWeightOverride, getModelWeightOverrides } from './model-weight-overrides.js';
-import { modelsWithOverriddenField, getCatalogModelTombstone } from './model-state.js';
+import { modelsWithOverriddenField, getCatalogModelTombstone, upstreamRetiredSql } from './model-state.js';
 import { parseBudget } from '../lib/budget.js';
 import { platformDropsResponseFormat } from '../lib/sampling-params.js';
 import { passesContextWindowFloor } from '../lib/min-context-window.js';
@@ -2001,7 +2001,7 @@ export function resolveModelGroupCandidates(
              m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
       FROM models m
       LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
-      WHERE m.id = ? AND m.enabled = 1
+      WHERE m.id = ? AND m.enabled = 1 AND NOT ${upstreamRetiredSql('m')}
     `)
     : db.prepare(`
       SELECT m.id as model_db_id, COALESCE(pm.priority, fc.priority, 0) as priority,
@@ -2013,7 +2013,7 @@ export function resolveModelGroupCandidates(
       FROM models m
       LEFT JOIN profile_models pm ON pm.profile_id = ? AND pm.model_db_id = m.id
       LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
-      WHERE m.id = ? AND m.enabled = 1
+      WHERE m.id = ? AND m.enabled = 1 AND NOT ${upstreamRetiredSql('m')}
     `);
 
   const rows: ChainRow[] = [];

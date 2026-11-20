@@ -6,7 +6,12 @@ import {
   resetModelRetirementObservations,
   RETIREMENT_CONFIRMATIONS_REQUIRED,
 } from '../../services/model-retirement.js';
-import { getCatalogModelTombstone, recordCatalogModelTombstone } from '../../services/model-state.js';
+import {
+  getCatalogModelTombstone, recordCatalogModelTombstone,
+  findServableModelByModelId, unservableModelReason,
+} from '../../services/model-state.js';
+import { buildModelListing } from '../../services/model-listing.js';
+import { encrypt } from '../../lib/crypto.js';
 import { applyCatalog } from '../../services/catalog-sync.js';
 
 // #634: NVIDIA retires a model upstream ("has reached its end of life"), and
@@ -202,6 +207,63 @@ describe('noteModelRetirementSignal (auto-disable with a reason — #634)', () =
       {},
     )).toBe(false);
     expect(isRoutable(row.id)).toBe(true);
+  });
+});
+
+describe('a retired model is unavailable by name and in listings', () => {
+  const ID = 'eol-listed-model';
+
+  function addKey(): void {
+    const { encrypted, iv, authTag } = encrypt('k');
+    getDb().prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, 'test', ?, ?, ?, 'healthy', 1)
+    `).run(PLATFORM, encrypted, iv, authTag);
+  }
+  // Its own display name: under unify, models sharing one are a single entry.
+  function seedListed(): number {
+    const id = seedModel(ID);
+    getDb().prepare("UPDATE models SET display_name = 'Listed Retiree', enabled = 1 WHERE id = ?").run(id);
+    return id;
+  }
+  const listed = () => buildModelListing().models.find(m => m.name === 'Listed Retiree');
+
+  beforeEach(() => {
+    resetModelRetirementObservations();
+    getDb().prepare("DELETE FROM catalog_model_tombstones WHERE model_id = ?").run(ID);
+  });
+
+  it('resolves and lists a healthy model, then stops once the provider retires it', () => {
+    const id = seedListed();
+    addKey();
+    expect(findServableModelByModelId(getDb(), ID)).toEqual({ id });
+    expect(listed()).toMatchObject({ available: 1, retired: false });
+
+    expect(noteModelRetirementSignal(routeFor(id, ID), NVIDIA_EOL, {})).toBe(true);
+
+    // The row itself stays enabled (the dashboard still shows it, tagged)...
+    expect((getDb().prepare('SELECT enabled FROM models WHERE id = ?').get(id) as { enabled: number }).enabled).toBe(1);
+    // ...but a request for the id no longer resolves, and the listing says why.
+    expect(findServableModelByModelId(getDb(), ID)).toBeUndefined();
+    expect(unservableModelReason(getDb(), ID)).toBe('retired');
+    expect(listed()).toMatchObject({ available: 0, retired: true, executionStatus: 'needsKey' });
+  });
+
+  it('comes back when the operator switches the chain row on again', () => {
+    const id = seedListed();
+    noteModelRetirementSignal(routeFor(id, ID), NVIDIA_EOL, {});
+    expect(findServableModelByModelId(getDb(), ID)).toBeUndefined();
+
+    getDb().prepare('UPDATE fallback_config SET enabled = 1 WHERE model_db_id = ?').run(id);
+    expect(findServableModelByModelId(getDb(), ID)).toEqual({ id });
+    expect(listed()).toMatchObject({ available: 1, retired: false });
+  });
+
+  it('reports a plainly disabled or unknown id as such, not as retired', () => {
+    const id = seedListed();
+    getDb().prepare('UPDATE models SET enabled = 0 WHERE id = ?').run(id);
+    expect(unservableModelReason(getDb(), ID)).toBe('disabled');
+    expect(unservableModelReason(getDb(), 'no-such-model')).toBe('unknown');
   });
 });
 

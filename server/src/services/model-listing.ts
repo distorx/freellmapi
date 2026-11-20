@@ -2,6 +2,7 @@ import type { ModelListRow } from '@freellmapi/shared/types.js';
 import { getDb } from '../db/index.js';
 import { isUnifyEnabled, getModelGroups } from './model-groups.js';
 import { CONTEXT_WINDOW_SAFETY_FACTOR, hasUsableKeyForModel } from './router.js';
+import { upstreamRetiredSql } from './model-state.js';
 
 // Shared catalog-listing logic behind both the OpenAI `GET /v1/models` and the
 // Anthropic `GET /v1/models` endpoints, so the two wire formats list the exact
@@ -29,6 +30,9 @@ export interface NormalizedModel {
   // breakdown), or `exhausted` (keys exist but every one is currently blocked,
   // so a request would fail immediately).
   executionStatus: 'ready' | 'needsKey' | 'exhausted';
+  // Every row behind this entry is retired upstream (410 / end of life) and not
+  // switched back on. Never available; lets /v1/models say why.
+  retired: boolean;
 }
 
 export interface ModelListing {
@@ -88,8 +92,10 @@ export function servableContextWindow(windows: readonly (number | null | undefin
 }
 
 export function buildModelListing(): ModelListing {
+  const retiredExpr = upstreamRetiredSql('m');
+  // A model retired upstream is not available, whatever keys exist for it.
   const availableExpr = `
-    (CASE WHEN m.enabled = 1 AND EXISTS (
+    (CASE WHEN m.enabled = 1 AND NOT ${retiredExpr} AND EXISTS (
         SELECT 1 FROM api_keys k
         WHERE k.platform = m.platform
           AND k.enabled = 1
@@ -102,10 +108,10 @@ export function buildModelListing(): ModelListing {
   if (isUnifyEnabled()) {
     // Unify ON: one entry per logical model group. Pull per-row availability +
     // context keyed by db id, then aggregate over each group's members.
-    type AvailRow = { id: number; platform: string; intelligence_rank: number; context_window: number | null; enabled: number; available: number; supports_tools: number; supports_vision: number };
+    type AvailRow = { id: number; platform: string; intelligence_rank: number; context_window: number | null; enabled: number; available: number; supports_tools: number; supports_vision: number; retired: number };
     const rows = db.prepare(`
       SELECT m.id, m.platform, m.intelligence_rank, m.context_window, m.supports_tools, m.supports_vision,
-             m.enabled AS enabled, ${availableExpr} AS available
+             m.enabled AS enabled, ${availableExpr} AS available, ${retiredExpr} AS retired
       FROM models m
     `).all() as AvailRow[];
     const byId = new Map(rows.map(r => [r.id, r]));
@@ -126,17 +132,20 @@ export function buildModelListing(): ModelListing {
         // A group is ready when ANY member can serve it — that is exactly the
         // choice the router has when it dispatches the group.
         executionStatus: executionStatusFor(g.members.map(m => m.model_db_id), available),
+        // Retired only when no enabled member is left standing.
+        retired: available !== 1 && infos.some(i => i.retired === 1) && !infos.some(i => i.enabled === 1 && i.retired !== 1),
       };
     });
   } else {
     // Unify OFF: one entry per model_id (dedup picks the available, smartest
     // representative row).
     const models = db.prepare(`
-      SELECT platform, model_id, display_name, context_window, enabled, available, intelligence_rank, id, supports_tools, supports_vision
+      SELECT platform, model_id, display_name, context_window, enabled, available, intelligence_rank, id, supports_tools, supports_vision, retired
       FROM (
         SELECT m.platform, m.model_id, m.display_name, m.context_window, m.intelligence_rank, m.id, m.supports_tools, m.supports_vision,
                m.enabled AS enabled,
                ${availableExpr} AS available,
+               ${retiredExpr} AS retired,
                ROW_NUMBER() OVER (
                  PARTITION BY m.model_id
                  ORDER BY ${availableExpr} DESC, m.intelligence_rank ASC, m.id ASC
@@ -144,7 +153,7 @@ export function buildModelListing(): ModelListing {
         FROM models m
       )
       WHERE rn = 1
-    `).all() as (ModelListRow & { intelligence_rank: number; id: number; supports_tools: number; supports_vision: number })[];
+    `).all() as (ModelListRow & { intelligence_rank: number; id: number; supports_tools: number; supports_vision: number; retired: number })[];
     allListed = models.map(m => ({
       id: m.model_id, name: m.display_name, ownedBy: m.platform,
       available: m.available, enabled: m.enabled, contextWindow: advertisedContextWindow(m.context_window),
@@ -153,6 +162,7 @@ export function buildModelListing(): ModelListing {
       supportsTools: m.supports_tools === 1,
       supportsVision: m.supports_vision === 1,
       executionStatus: executionStatusFor([m.id], m.available),
+      retired: m.available !== 1 && m.enabled === 1 && m.retired === 1,
     }));
   }
 
