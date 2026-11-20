@@ -2562,7 +2562,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Fallback-v2 hedging: the loop aborts this controller (via abortInFlight)
   // when the wall-clock retry budget expires mid-attempt, canceling the
   // in-flight upstream instead of waiting for a stalled attempt to time out.
-  const hedgeAbort = new AbortController();
+  let hedgeAbort = new AbortController();
 
   // Decision routing (#1354): with the 'decision' strategy on, a decision
   // model picks which preset (Smartest / Fastest / Balanced / Most reliable)
@@ -2578,6 +2578,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     logIdentity: { surface: 'chat completions', requestId: requestGroupId, requestedModel: requestedModelLabel },
     clientGone: () => clientGone,
     abortInFlight: () => hedgeAbort.abort(newHedgeAbortError()),
+    // Stall failover: an aborted signal stays aborted, so each abandoned
+    // attempt is followed by a fresh controller. Both dispatch paths compose
+    // their fetch signal from `hedgeAbort` at call time, so they pick it up.
+    renewInFlightAbort: () => { hedgeAbort = new AbortController(); },
+    streaming: stream === true,
     route: () => {
       // When a handoff could fire this turn, pad the token estimate so the router's
       // context-window and TPM checks account for the extra system message overhead.
@@ -2839,6 +2844,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             // it NULL on long-thinking turns that never flushed).
             if (ttfbMs === null && (text.length > 0 || reasoning.length > 0)) {
               ttfbMs = Date.now() - start;
+              // First upstream token: the attempt is alive (stall failover).
+              ctx.noteFirstByte();
             }
 
             if (text.length === 0) {
