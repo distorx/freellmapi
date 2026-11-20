@@ -447,6 +447,16 @@ function headroomRamp(remainingRaw: number, opts?: HeadroomThresholds): number {
   return floor + (1 - floor) * (remaining / rampStart);
 }
 
+/**
+ * The same ramp for a meter that is already a fraction: the share of a
+ * provider-reported allowance still left (0..1). `undefined` (no reading) has
+ * no opinion, like an unknown monthly budget.
+ */
+export function remainingHeadroomFactor(remaining: number | undefined, opts?: HeadroomThresholds): number {
+  if (remaining === undefined || !Number.isFinite(remaining)) return 1;
+  return headroomRamp(remaining, opts);
+}
+
 // ── Guardrail: rate-window headroom (#899) ──────────────────────────────────
 // The monthly-budget guardrail above only has an opinion about models that
 // declare a `monthly_token_budget`. The far more common free-tier shape is a

@@ -131,6 +131,10 @@ export interface QuotaProbeSpec {
   limitFields: string[];
   remainingFields: string[];
   notes?: string;
+  /** For a balance that is not a flat limit/remaining pair: turn the response
+   *  body into a reading, or null when it carries none. Replaces the field
+   *  lookup, and may supply the reset time and the note. */
+  parse?: (body: unknown) => { limit: number | null; remaining: number | null; resetAt?: string | null; notes?: string } | null;
 }
 
 export class OpenAICompatProvider extends BaseProvider {
@@ -722,8 +726,10 @@ export class OpenAICompatProvider extends BaseProvider {
         }
         return null;
       };
-      const limit = pick(spec.limitFields);
-      const remaining = pick(spec.remainingFields);
+      const parsed = spec.parse ? spec.parse(body) : undefined;
+      if (spec.parse && !parsed) return false;
+      const limit = parsed ? parsed.limit : pick(spec.limitFields);
+      const remaining = parsed ? parsed.remaining : pick(spec.remainingFields);
       if (limit === null && remaining === null) return false;
       const record = recordQuotaObservation({
         platform: this.platform,
@@ -734,10 +740,11 @@ export class OpenAICompatProvider extends BaseProvider {
         metric: spec.metric,
         limit,
         remaining,
+        resetAt: parsed?.resetAt ?? null,
         resetStrategy: 'provider_reported',
         source: 'quota_api',
         statusCode: res.status,
-        notes: spec.notes ?? null,
+        notes: parsed?.notes ?? spec.notes ?? null,
       });
       return record !== null;
     } catch {

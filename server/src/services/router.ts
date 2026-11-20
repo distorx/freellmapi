@@ -20,7 +20,7 @@ import {
   BANDIT_PRESETS, DEFAULT_STRATEGY, type PresetStrategy, type RoutingStrategy, type RoutingWeights,
   type KeySelectionStrategy,
   reliabilityPosterior, expectedReliability, sampleBeta,
-  speedScore, intelligenceScore, intelligenceComposite, headroomFactor, rateWindowHeadroomFactor,
+  speedScore, intelligenceScore, intelligenceComposite, headroomFactor, remainingHeadroomFactor, rateWindowHeadroomFactor,
   rateLimitFactor, combineScore,
   peakAdjustedWeights, taskAdjustedWeights, TASK_WEIGHT_SHARE, isValidPeakHour, isValidTimezone,
   DEFAULT_PEAK_HOURS, type PeakHoursConfig,
@@ -43,7 +43,7 @@ import { isDegraded } from './degradation.js';
 import { modelStatsKey, endpointScopeForBaseUrl } from '../lib/endpoint-scope.js';
 import { isToolBenched } from '../lib/tool-capability.js';
 import { parseModelScope, scopeAllows } from '../lib/model-scope.js';
-import { getKeyQuotaHeadroom, inferQuotaPoolKey } from './provider-quota.js';
+import { getKeyQuotaHeadroom, getPlatformQuotaHeadroom, inferQuotaPoolKey, isInsideQuotaReserve } from './provider-quota.js';
 import type { BaseProvider } from '../providers/base.js';
 import type { Platform } from '@freellmapi/shared/types.js';
 import type { Db } from '../db/types.js';
@@ -1153,7 +1153,11 @@ function scoreChainEntry(
   // would push a model that is low on both to floor², below the floor the
   // operator configured. Taking the binding constraint keeps the floor meaning
   // what it says — the same rule getKeyQuotaHeadroom applies across metrics.
-  const headroom = Math.min(monthlyHeadroom, windowHeadroom);
+  // A third meter on the same ramp: what the provider itself says is left
+  // (a credit balance, a subscription window). It is the only one that sees
+  // usage made outside this router, on a key shared with other tools.
+  const providerHeadroom = remainingHeadroomFactor(getPlatformQuotaHeadroom(entry.platform as Platform), headroomCfg);
+  const headroom = Math.min(monthlyHeadroom, windowHeadroom, providerHeadroom);
   const rl = rateLimitFactor(getPenalty(entry.model_db_id));
 
   // Per-model env overrides (#738) scale the final score so a slow or
@@ -1689,6 +1693,9 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
       note(checkin ? 'checkin-required' : 'cooldown');
       continue;
     }
+    // The provider reports this key at or below the share of its allowance the
+    // operator reserved for everything else that uses it.
+    if (isInsideQuotaReserve(entry.platform as Platform, key.id)) { note('provider-quota-reserve'); continue; }
     if (!canUseProvider(entry.platform, key.id)) { note('provider-daily-cap'); continue; }
     // Account-wide per-minute budget, checked before the per-model gates: a model
     // with a NULL rpm_limit would otherwise sail past them and spend a budget its
