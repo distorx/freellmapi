@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { getDb } from '../db/index.js';
+import { getDb, getSetting } from '../db/index.js';
 // Single shared Retry-After parser (was duplicated here and in providers/base.ts).
 import { parseRetryAfterMs } from '../providers/base.js';
 import type {
@@ -557,6 +557,70 @@ export function getKeyQuotaHeadroom(platform: Platform): Map<number, number> {
   }
   headroomCache.set(platform, { db, at: now, map });
   return map;
+}
+
+/**
+ * The most headroom any key of `platform` reports, 0..1, or undefined when no
+ * key has a usable reading. Model scoring uses it: when even the best key of a
+ * provider is nearly out, every model on that provider is about to refuse.
+ * The best key, not the worst, because key selection (#919) already reaches
+ * for the fullest one.
+ */
+export function getPlatformQuotaHeadroom(platform: Platform): number | undefined {
+  const perKey = getKeyQuotaHeadroom(platform);
+  if (perKey.size === 0) return undefined;
+  let best = 0;
+  for (const ratio of perKey.values()) if (ratio > best) best = ratio;
+  return best;
+}
+
+// ── Quota reserve ───────────────────────────────────────────────────────────
+// A provider-reported balance usually belongs to an account the router does
+// not have to itself: the same subscription key often serves an assistant or
+// an editor directly. Spending the allowance to zero here starves them. A
+// reserve is the share of the allowance the router leaves alone: once a key's
+// reported headroom is at or below it, that key is not a candidate, and auto
+// routing goes elsewhere exactly as it does for a key on cooldown.
+//
+// `quota_reserve_percent_<platform>` (setting, then the upper-cased env var),
+// 0..100, default 0 = off. Only a key with a provider-reported reading can be
+// held back; no reading means unknown, never "empty".
+const RESERVE_TTL_MS = 5_000;
+const reserveCache = new Map<string, { at: number; fraction: number }>();
+
+/** The reserve for `platform` as a fraction 0..1 (0 = off). */
+export function getQuotaReserveFraction(platform: Platform): number {
+  const now = Date.now();
+  const cached = reserveCache.get(platform);
+  if (cached && now - cached.at < RESERVE_TTL_MS) return cached.fraction;
+  const key = `quota_reserve_percent_${platform}`;
+  let stored: string | undefined;
+  try {
+    stored = getSetting(key);
+  } catch {
+    stored = undefined; // DB not ready — never throw on the routing path
+  }
+  let fraction = 0;
+  for (const raw of [stored, process.env[key.toUpperCase()]]) {
+    if (raw === undefined || raw.trim() === '') continue;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0 && n <= 100) { fraction = n / 100; break; }
+  }
+  reserveCache.set(platform, { at: now, fraction });
+  return fraction;
+}
+
+/** True when this key's reported headroom is inside the platform's reserve. */
+export function isInsideQuotaReserve(platform: Platform, keyId: number): boolean {
+  const reserve = getQuotaReserveFraction(platform);
+  if (reserve <= 0) return false;
+  const headroom = getKeyQuotaHeadroom(platform).get(keyId);
+  return headroom !== undefined && headroom <= reserve;
+}
+
+/** Test seam: forget memoised reserves. */
+export function resetQuotaReserveCache(): void {
+  reserveCache.clear();
 }
 
 /** Drop the memoised headroom for one platform (or all of them). Called on

@@ -2,6 +2,7 @@ import type { Platform } from '@freellmapi/shared/types.js';
 import type { BaseProvider } from './base.js';
 import { GoogleProvider } from './google.js';
 import { OpenAICompatProvider } from './openai-compat.js';
+import { parseOllamaBalance } from './ollama-balance.js';
 import { CohereProvider } from './cohere.js';
 import { TavilyProvider } from './tavily.js';
 import { ExaProvider } from './exa.js';
@@ -341,6 +342,15 @@ register(new OpenAICompatProvider({
   name: 'Ollama Cloud',
   baseUrl: 'https://ollama.com/v1',
   timeoutMs: 120000,
+  // The account's own reading of what is left (see ollama-balance.ts). It is
+  // the only meter there is for a subscription on session/weekly terms.
+  quotaProbe: {
+    url: 'https://ollama.com/api/balance',
+    metric: 'credits',
+    limitFields: [],
+    remainingFields: [],
+    parse: parseOllamaBalance,
+  },
 }));
 
 // Kilo AI Gateway — OpenAI-compatible aggregator. Kilo documents anonymous
