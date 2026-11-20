@@ -11,6 +11,7 @@ import type {
 } from '@freellmapi/shared/types.js';
 import { routeRequest, hasEnabledVisionModel, hasEnabledToolsModel, resolveStickyPreference, routingReserveTokens, resolveModelGroupCandidates, resolveRoutingChain, failureAttributionFor, type RouteResult, type ResolvedChain, type ChainRow } from '../services/router.js';
 import { getDb } from '../db/index.js';
+import { findServableModelByModelId, unservableModelReason, upstreamRetiredSql, UNSERVABLE_REASON_TEXT } from '../services/model-state.js';
 import { resolveAuth, prependSystemPrompt } from '../lib/system-prompt.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
 import { contentToString, estimateInputTokens, messageHasImage } from '../lib/content.js';
@@ -889,7 +890,7 @@ export async function handleResponses(req: Request, res: Response): Promise<void
       groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
       if (groupChain.length === 0) {
         const placeholders = members.map(() => '?').join(',');
-        const anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
+        const anyEnabled = db.prepare(`SELECT 1 FROM models m WHERE m.id IN (${placeholders}) AND m.enabled = 1 AND NOT ${upstreamRetiredSql('m')} LIMIT 1`).get(...members);
         const reason = anyEnabled ? 'has no providers with an enabled key' : 'is disabled';
         res.status(400).json({
           error: {
@@ -906,12 +907,11 @@ export async function handleResponses(req: Request, res: Response): Promise<void
       const sticky = getStickyModel(sessionMessages, sessionIdHeader, stickyStrategyKey);
       preferredModel = (sticky != null && groupChain.some(r => r.model_db_id === sticky)) ? sticky : undefined;
     } else {
-      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(routedModel) as { id: number } | undefined;
+      const enabled = findServableModelByModelId(db, routedModel);
       if (enabled) {
         preferredModel = enabled.id;
       } else {
-        const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(routedModel) as { id: number } | undefined;
-        const reason = disabled ? 'is disabled' : 'is not in the catalog';
+        const reason = UNSERVABLE_REASON_TEXT[unservableModelReason(db, routedModel)];
         res.status(400).json({
           error: {
             message: `Model '${routedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,

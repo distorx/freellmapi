@@ -6,6 +6,7 @@ import type {
   ChatToolDefinition,
 } from '@freellmapi/shared/types.js';
 import { getDb } from '../db/index.js';
+import { findServableModelByModelId, unservableModelReason, UNSERVABLE_REASON_TEXT } from '../services/model-state.js';
 import {
   routeRequest,
   resolveStickyPreference,
@@ -134,11 +135,12 @@ function resolvePin(model: string | undefined, messages: ChatMessage[], sessionI
     };
   }
 
-  const enabled = db.prepare(
-    'SELECT id FROM models WHERE model_id = ? AND enabled = 1',
-  ).get(requested) as { id: number } | undefined;
+  const enabled = findServableModelByModelId(db, requested);
   if (!enabled) {
-    const err = new Error(`Model '${requested}' is disabled or is not in the catalog`) as Error & { status?: number; code?: string };
+    const why = unservableModelReason(db, requested);
+    const err = new Error(why === 'retired'
+      ? `Model '${requested}' ${UNSERVABLE_REASON_TEXT.retired}`
+      : `Model '${requested}' is disabled or is not in the catalog`) as Error & { status?: number; code?: string };
     err.status = 404;
     err.code = 'model_not_found';
     throw err;

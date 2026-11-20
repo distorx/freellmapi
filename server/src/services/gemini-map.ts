@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { getDb, getSetting, setSetting } from '../db/index.js';
+import { findServableModelByModelId } from './model-state.js';
 
 const SETTING_KEY = 'gemini_model_map';
 
@@ -72,9 +73,7 @@ export function resolveGeminiModel(model?: string): string {
   if (family) {
     const target = getGeminiModelMap()[family];
     if (!target || target === 'auto') return 'auto';
-    const exists = getDb().prepare(
-      'SELECT 1 FROM models WHERE model_id = ? AND enabled = 1',
-    ).get(target);
+    const exists = findServableModelByModelId(getDb(), target);
     return exists ? target : 'auto';
   }
   return raw || 'auto';
