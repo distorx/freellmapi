@@ -166,8 +166,11 @@ const updateKeySchema = z.object({
   groupLabel: z.string().trim().max(80).optional(),
   // An absent credential leaves the encrypted key untouched.
   key: z.string().trim().min(1).optional(),
-}).refine(data => data.enabled !== undefined || data.label !== undefined || data.modelScope !== undefined || data.proxyUrl !== undefined || data.key !== undefined || data.monthlyRequestCap !== undefined || data.monthlyTokenCap !== undefined || data.groupLabel !== undefined, {
-  message: 'At least one of enabled, label, modelScope, proxyUrl, key, monthlyRequestCap, monthlyTokenCap or groupLabel must be provided',
+  // This key is on a paid plan: its platform's models are read from the
+  // provider's own list, not only the catalog's free ones.
+  paidPlan: z.boolean().optional(),
+}).refine(data => data.paidPlan !== undefined || data.enabled !== undefined || data.label !== undefined || data.modelScope !== undefined || data.proxyUrl !== undefined || data.key !== undefined || data.monthlyRequestCap !== undefined || data.monthlyTokenCap !== undefined || data.groupLabel !== undefined, {
+  message: 'At least one of enabled, label, modelScope, proxyUrl, key, monthlyRequestCap, monthlyTokenCap, groupLabel or paidPlan must be provided',
 });
 
 const importKeySchema = z.object({
@@ -493,6 +496,7 @@ keysRouter.get('/', (_req: Request, res: Response) => {
       // Optional custom-endpoint group label (#1176); null = legacy single
       // "Custom" group.
       groupLabel: row.group_label ?? null,
+      paidPlan: row.paid_plan === 1,
       monthlyRequestCap: budgetCaps.requestCap,
       monthlyTokenCap: budgetCaps.tokenCap,
       monthlyUsage: {
@@ -1950,7 +1954,7 @@ keysRouter.patch('/:id', (req: Request, res: Response) => {
     return;
   }
 
-  const { enabled, label, modelScope, proxyUrl, key, monthlyRequestCap, monthlyTokenCap, groupLabel } = parsed.data;
+  const { enabled, label, modelScope, proxyUrl, key, monthlyRequestCap, monthlyTokenCap, groupLabel, paidPlan } = parsed.data;
   const updates: string[] = [];
   const values: (string | number | null)[] = [];
   let changedKey: string | undefined;
@@ -2019,6 +2023,10 @@ keysRouter.patch('/:id', (req: Request, res: Response) => {
     updates.push('monthly_token_cap = ?');
     values.push(monthlyTokenCap);
   }
+  if (paidPlan !== undefined) {
+    updates.push('paid_plan = ?');
+    values.push(paidPlan ? 1 : 0);
+  }
   // Custom-endpoint group label (#1176) is written below, across the
   // endpoint's whole key pool rather than this one row.
   const db = getDb();
@@ -2059,7 +2067,16 @@ keysRouter.patch('/:id', (req: Request, res: Response) => {
 
   if (changedKey !== undefined) clearCooldownsForKey(id);
 
+  // Flagging a paid plan is the request to use its models: fetch the
+  // platform's list now rather than waiting for the next health pass. Fire and
+  // forget, like the pass a newly saved key starts.
+  if (paidPlan === true) {
+    const flagged = db.prepare('SELECT platform FROM api_keys WHERE id = ?').get(id) as { platform: string } | undefined;
+    if (flagged && flagged.platform !== 'custom') void triggerBuiltinModelDiscovery(db, flagged.platform, 'key_added')?.catch(() => {});
+  }
+
   const response: Record<string, unknown> = { success: true };
+  if (paidPlan !== undefined) response.paidPlan = paidPlan;
   if (enabled !== undefined) response.enabled = enabled;
   if (label !== undefined) response.label = label;
   if (proxyUrl !== undefined) response.maskedProxyUrl = maskProxyUrl(proxyUrl);

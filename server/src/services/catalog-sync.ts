@@ -962,8 +962,15 @@ function applyCatalogInner(db: Db, catalog: Catalog): NonNullable<SyncResult['co
     const discoveredRows = db
       .prepare('SELECT id, platform FROM models WHERE source = ?')
       .all(DISCOVERED_MODEL_SOURCE) as { id: number; platform: string }[];
+    // A paid-plan key's discovered rows are not a stopgap: the catalog lists
+    // that provider's free models only and will never carry the rest.
+    const paidPlan = new Set(
+      (db.prepare("SELECT DISTINCT platform FROM api_keys WHERE enabled = 1 AND paid_plan = 1").all() as { platform: string }[])
+        .map(r => r.platform),
+    );
     for (const d of discoveredRows) {
       if (!managed.has(d.platform)) continue;
+      if (paidPlan.has(d.platform)) continue;
       deleteFb.run(d.id);
       deleteModel.run(d.id);
       counts.removed++;

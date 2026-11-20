@@ -67,6 +67,22 @@ export function builtinDiscoveryMode(): BuiltinDiscoveryMode {
 
 export type IneligibleReason = 'disabled' | 'not_allowlisted' | 'not_openai_compatible' | 'catalog_managed';
 
+/**
+ * True when an enabled key of `platform` is flagged as a paid plan
+ * (api_keys.paid_plan). The catalog lists a provider's free models only; the
+ * flag is the operator declaring that this key's subscription serves more, so
+ * the platform's own /models list becomes the source for them.
+ */
+export function hasPaidPlanKey(db: Db, platform: string): boolean {
+  return !!db.prepare('SELECT 1 FROM api_keys WHERE platform = ? AND enabled = 1 AND paid_plan = 1 LIMIT 1').get(platform);
+}
+
+/** Every platform with an enabled paid-plan key. */
+export function paidPlanPlatforms(db: Db): string[] {
+  return (db.prepare("SELECT DISTINCT platform FROM api_keys WHERE enabled = 1 AND paid_plan = 1 AND platform != 'custom'").all() as { platform: string }[])
+    .map(r => r.platform);
+}
+
 export interface DiscoveryEligibility {
   eligible: boolean;
   reason?: IneligibleReason;
@@ -77,11 +93,18 @@ export interface DiscoveryEligibility {
 /** Whether `platform` may fill its model list from its own /models. */
 export function builtinDiscoveryEligibility(db: Db, platform: string): DiscoveryEligibility {
   if (builtinDiscoveryMode() === 'off') return { eligible: false, reason: 'disabled' };
-  if (!(BUILTIN_DISCOVERY_PLATFORMS as readonly string[]).includes(platform)) {
+  // A paid-plan key overrides both gates below. They exist to keep a free
+  // install from being handed models the catalog gates or has ruled out; an
+  // operator who flags a subscription has asked for exactly those models, and
+  // the catalog's own rows are still never touched (registration is
+  // INSERT-only).
+  const paidPlan = hasPaidPlanKey(db, platform);
+  if (!paidPlan && !(BUILTIN_DISCOVERY_PLATFORMS as readonly string[]).includes(platform)) {
     return { eligible: false, reason: 'not_allowlisted' };
   }
   const provider = getProvider(platform as Platform);
   if (!(provider instanceof OpenAICompatProvider)) return { eligible: false, reason: 'not_openai_compatible' };
+  if (paidPlan) return { eligible: true, provider };
   if (appliedCatalogPlatforms(db).has(platform) || hasCatalogOwnedRows(db, platform)) {
     return { eligible: false, reason: 'catalog_managed' };
   }
@@ -136,6 +159,15 @@ export async function discoverBuiltinModels(
 ): Promise<DiscoveredModel[]> {
   const apiKey = apiKeyOverride?.trim() || decrypt(key.encrypted_key, key.iv, key.auth_tag);
   return withKeyProxy(decryptProxyUrl(key), () => discoverProviderModels(provider, apiKey, provider.modelsUrl.replace(/\/models\/?$/, '')));
+}
+
+/** Ids this platform already serves as a decision, media or embedding model. */
+export function nonChatModelIds(db: Db, platform: string): Set<string> {
+  const rows = db.prepare(`
+    SELECT model_id FROM media_models WHERE platform = ?
+    UNION SELECT model_id FROM embedding_models WHERE platform = ?
+  `).all(platform, platform) as { model_id: string }[];
+  return new Set(rows.map(r => r.model_id));
 }
 
 /** Discovered model ids already present on this platform, in any provenance. */
@@ -239,15 +271,26 @@ function patternMatches(pattern: string, id: string): boolean {
  *  - an upstream that prices a model and says it is not free is skipped;
  *  - CUSTOM_MODEL_SYNC_FREE_PATTERNS, when set, applies here too (#746).
  */
-export function autoRegistrable(models: DiscoveredModel[], platform?: string): { accepted: DiscoveredModel[]; nonChat: number; paid: number } {
+export function autoRegistrable(
+  models: DiscoveredModel[],
+  platform?: string,
+  options: { paidPlan?: boolean; nonChatIds?: ReadonlySet<string> } = {},
+): { accepted: DiscoveredModel[]; nonChat: number; paid: number } {
   const freePatterns = customModelSyncFreePatterns();
   const accepted: DiscoveredModel[] = [];
   let nonChat = 0;
   let paid = 0;
   for (const model of models) {
     if (model.kind !== undefined || (platform === 'ovh' && specialistTask(model.id))) { nonChat += 1; continue; }
-    if (model.priceNote !== undefined && model.isFree !== true) { paid += 1; continue; }
-    if (freePatterns.length > 0 && !freePatterns.some(p => patternMatches(p, model.id))) { paid += 1; continue; }
+    // An id the platform already serves as a decision, embedding or media
+    // model is not a chat model, whatever its name looks like.
+    if (options.nonChatIds?.has(model.id)) { nonChat += 1; continue; }
+    // The price and free-pattern gates keep an unattended pass off models that
+    // cost money. On a paid plan that is the point, so they do not apply.
+    if (!options.paidPlan) {
+      if (model.priceNote !== undefined && model.isFree !== true) { paid += 1; continue; }
+      if (freePatterns.length > 0 && !freePatterns.some(p => patternMatches(p, model.id))) { paid += 1; continue; }
+    }
     accepted.push(model);
   }
   return { accepted, nonChat, paid };
@@ -268,7 +311,7 @@ function usableKeys(db: Db, platform: string): KeyRow[] {
     SELECT id, platform, encrypted_key, iv, auth_tag, proxy_encrypted, proxy_iv, proxy_auth_tag
       FROM api_keys
      WHERE platform = ? AND enabled = 1 AND status != 'invalid'
-     ORDER BY CASE status WHEN 'healthy' THEN 0 ELSE 1 END, id
+     ORDER BY paid_plan DESC, CASE status WHEN 'healthy' THEN 0 ELSE 1 END, id
   `).all(platform) as KeyRow[];
 }
 
@@ -281,10 +324,19 @@ export async function runBuiltinModelDiscovery(db: Db, only?: string): Promise<B
   const result: BuiltinDiscoveryResult = {
     platforms: 0, added: 0, skipped: 0, tombstoned: 0, nonChatSkipped: 0, paidSkipped: 0, failures: [],
   };
-  if (builtinDiscoveryMode() !== 'auto') return result;
+  const mode = builtinDiscoveryMode();
+  if (mode === 'off') return result;
 
-  const platforms = only ? [only] : [...BUILTIN_DISCOVERY_PLATFORMS];
+  // 'manual' keeps unattended passes off the allowlisted platforms, because
+  // nobody chose their models. A paid-plan flag IS that choice, made per key,
+  // so those platforms are discovered in manual mode too.
+  const paid = new Set(paidPlanPlatforms(db));
+  const platforms = only
+    ? [only]
+    : [...new Set([...(mode === 'auto' ? BUILTIN_DISCOVERY_PLATFORMS : []), ...paid])];
   for (const platform of platforms) {
+    const paidPlan = paid.has(platform);
+    if (mode !== 'auto' && !paidPlan) continue;
     const eligibility = builtinDiscoveryEligibility(db, platform);
     if (!eligibility.eligible || !eligibility.provider) continue;
     const keys = usableKeys(db, platform);
@@ -295,9 +347,9 @@ export async function runBuiltinModelDiscovery(db: Db, only?: string): Promise<B
       // Re-check after the network round-trip: a catalog sync may have landed
       // in between, and the catalog always wins.
       if (!isBuiltinDiscoveryEligible(db, platform)) continue;
-      const { accepted, nonChat, paid } = autoRegistrable(discovered, platform);
+      const { accepted, nonChat, paid: paidSkipped } = autoRegistrable(discovered, platform, { paidPlan, nonChatIds: nonChatModelIds(db, platform) });
       result.nonChatSkipped += nonChat;
-      result.paidSkipped += paid;
+      result.paidSkipped += paidSkipped;
       const registered = registerDiscoveredModels(
         db,
         platform,
@@ -332,13 +384,15 @@ export function triggerBuiltinModelDiscovery(
   platform: string,
   reason: 'key_added' | 'healthy',
 ): Promise<BuiltinDiscoveryResult> | null {
-  if (builtinDiscoveryMode() !== 'auto') return null;
+  if (builtinDiscoveryMode() !== 'auto' && !hasPaidPlanKey(db, platform)) return null;
   if (!isBuiltinDiscoveryEligible(db, platform)) return null;
   const pending = inFlight.get(platform);
   if (pending) return pending;
   if (reason === 'healthy') {
+    // A paid-plan platform always has models (the catalog's free ones), and its
+    // subscription list still changes; the hourly gap below is its only brake.
     const hasModels = db.prepare('SELECT 1 FROM models WHERE platform = ? LIMIT 1').get(platform);
-    if (hasModels) return null;
+    if (hasModels && !hasPaidPlanKey(db, platform)) return null;
     const last = lastEventRunMs.get(platform) ?? 0;
     if (Date.now() - last < EVENT_MIN_GAP_MS) return null;
   }

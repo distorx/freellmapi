@@ -55,6 +55,7 @@ const CLOUDFLARE_NEURON_USAGE_FILENAME = '20261104_000001_cloudflare_neuron_usag
 const KEY_VERIFICATION_BASIS_FILENAME = '20261105_000001_key_verification_basis.ts';
 const MODEL_MONTHLY_USAGE_FILENAME = '20261111_000001_model_monthly_usage.ts';
 const PROFILE_ROUTING_STRATEGY_FILENAME = '20261111_000002_profile_routing_strategy.ts';
+const KEY_PAID_PLAN_FILENAME = '20261120_000001_key_paid_plan.ts';
 
 interface SchemaRow {
   type: string;
@@ -157,6 +158,7 @@ describe('migration round trip', () => {
         KEY_VERIFICATION_BASIS_FILENAME,
         MODEL_MONTHLY_USAGE_FILENAME,
         PROFILE_ROUTING_STRATEGY_FILENAME,
+        KEY_PAID_PLAN_FILENAME,
       ]);
     } finally {
       db.close();
