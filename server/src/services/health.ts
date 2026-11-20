@@ -248,6 +248,56 @@ export function supportsQuotaPolling(provider: BaseProvider): boolean {
   return provider.hasQuotaProbe;
 }
 
+// ── Usage-driven quota poll ─────────────────────────────────────────────────
+// The poll above rides the health pass and is throttled to one reading per
+// QUOTA_POLL_INTERVAL_MS. That is fine for a balance that moves slowly, and
+// far too slow for one that does not: an agent workload took an allowance from
+// 99% to 15% in about forty minutes while routing still held a 15-minute-old
+// reading above the operator's reserve. A balance is worth re-reading exactly
+// when it is being spent, so every served request may trigger a poll for its
+// key, at most once per QUOTA_POLL_IN_USE_INTERVAL_MS (default one minute; the
+// env var of the same name overrides it, 0 turns this off). An idle key costs
+// nothing, and a key whose provider has no balance endpoint is remembered and
+// skipped without a lookup.
+export const DEFAULT_QUOTA_POLL_IN_USE_INTERVAL_MS = 60_000;
+const lastInUsePollAt = new Map<number, number>();
+const noQuotaProbeKeys = new Set<number>();
+
+export function quotaPollInUseIntervalMs(): number {
+  const raw = process.env.QUOTA_POLL_IN_USE_INTERVAL_MS;
+  if (raw !== undefined && raw.trim() !== '') {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return DEFAULT_QUOTA_POLL_IN_USE_INTERVAL_MS;
+}
+
+/** Test seam: forget the per-key throttle and the no-probe memo. */
+export function resetQuotaPollAfterUse(): void {
+  lastInUsePollAt.clear();
+  noQuotaProbeKeys.clear();
+}
+
+/** Fire-and-forget; returns the poll's promise only so tests can await it. */
+export function pollQuotaAfterUse(keyId: number, now = Date.now()): Promise<boolean> | null {
+  const interval = quotaPollInUseIntervalMs();
+  if (interval <= 0 || noQuotaProbeKeys.has(keyId)) return null;
+  const last = lastInUsePollAt.get(keyId);
+  if (last !== undefined && now - last < interval) return null;
+  lastInUsePollAt.set(keyId, now);
+  const run = (async (): Promise<boolean> => {
+    const row = getDb().prepare('SELECT * FROM api_keys WHERE id = ? AND enabled = 1').get(keyId) as any;
+    if (!row) return false;
+    const provider = resolveProvider(row.platform as Platform, row.base_url);
+    if (!provider || !supportsQuotaPolling(provider)) {
+      noQuotaProbeKeys.add(keyId);
+      return false;
+    }
+    return pollKeyQuota(keyId, row, provider);
+  })().catch(() => false);
+  return run;
+}
+
 /** Throttled, self-contained quota poll for one key — the entry point other
  *  services (or a future scheduler) can use without duplicating the gate. */
 export async function maybePollKeyQuota(keyId: number): Promise<boolean> {
@@ -485,6 +535,7 @@ export function markKeyHealthyFromRequest(keyId: number): void {
     // #1510: a served request is the strongest reachability evidence there is —
     // it also ends any transport-error streak, parked or not.
     transportFailures.delete(keyId);
+    pollQuotaAfterUse(keyId);
   } catch {
     // Never let health bookkeeping break a request that already succeeded.
   }

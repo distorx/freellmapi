@@ -53,6 +53,9 @@ function logRows() {
 describe('decision service', () => {
   beforeEach(() => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    // These tests count upstream calls; a served request would otherwise add
+    // one more to the provider's balance endpoint (health.pollQuotaAfterUse).
+    process.env.QUOTA_POLL_IN_USE_INTERVAL_MS = '0';
     initDb(':memory:');
     seedDecisionModels();
     clearAllCooldowns(Number.MAX_SAFE_INTEGER);
@@ -61,6 +64,7 @@ describe('decision service', () => {
   afterEach(() => {
     globalThis.fetch = realFetch;
     vi.restoreAllMocks();
+    delete process.env.QUOTA_POLL_IN_USE_INTERVAL_MS;
   });
 
   it('has adapters for the supported decision platforms', () => {

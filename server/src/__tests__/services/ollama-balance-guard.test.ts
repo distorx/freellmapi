@@ -8,6 +8,7 @@ import {
   isInsideQuotaReserve, recordQuotaObservation, resetQuotaReserveCache, invalidateKeyQuotaHeadroom,
 } from '../../services/provider-quota.js';
 import { remainingHeadroomFactor } from '../../services/scoring.js';
+import { markKeyHealthyFromRequest, pollQuotaAfterUse, resetQuotaPollAfterUse } from '../../services/health.js';
 
 // An Ollama Cloud subscription on session/weekly terms is metered in GPU time
 // and reported only as "percent of the window left". These tests pin the
@@ -149,5 +150,49 @@ describe('provider-reported balance in routing', () => {
     process.env.QUOTA_RESERVE_PERCENT_OLLAMA = '250';
     resetQuotaReserveCache();
     expect(getQuotaReserveFraction('ollama')).toBe(0);
+  });
+
+  describe('re-reading the balance while it is being spent', () => {
+    const balanceAt = (percent: number) => vi.fn(async () => new Response(
+      JSON.stringify({ included: { weekly: { remaining_percent: percent, resets_at: '2099-01-04T00:00:00Z' } } }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ));
+
+    beforeEach(() => resetQuotaPollAfterUse());
+    afterEach(() => { delete process.env.QUOTA_POLL_IN_USE_INTERVAL_MS; });
+
+    it('polls on a served request, then at most once per interval for that key', async () => {
+      const keyId = addKey();
+      const mock = balanceAt(40);
+      globalThis.fetch = mock as any;
+
+      expect(await pollQuotaAfterUse(keyId, 1_000_000)).toBe(true);
+      invalidateKeyQuotaHeadroom();
+      expect(getKeyQuotaHeadroom('ollama').get(keyId)).toBeCloseTo(0.4, 5);
+
+      expect(pollQuotaAfterUse(keyId, 1_000_000 + 30_000)).toBeNull();   // inside the minute
+      expect(await pollQuotaAfterUse(keyId, 1_000_000 + 61_000)).toBe(true);
+      expect(mock).toHaveBeenCalledTimes(2);
+    });
+
+    it('is started by the same hook a successful request already calls', async () => {
+      const keyId = addKey();
+      const mock = balanceAt(12);
+      globalThis.fetch = mock as any;
+      markKeyHealthyFromRequest(keyId);
+      await vi.waitFor(() => expect(mock).toHaveBeenCalledTimes(1));
+    });
+
+    it('remembers a key whose provider has no balance endpoint, and can be switched off', async () => {
+      const groq = addKey('groq');
+      const mock = balanceAt(50);
+      globalThis.fetch = mock as any;
+      expect(await pollQuotaAfterUse(groq, 1_000)).toBe(false);
+      expect(pollQuotaAfterUse(groq, 10_000_000)).toBeNull();
+      expect(mock).not.toHaveBeenCalled();
+
+      process.env.QUOTA_POLL_IN_USE_INTERVAL_MS = '0';
+      expect(pollQuotaAfterUse(addKey(), 1_000)).toBeNull();
+    });
   });
 });
