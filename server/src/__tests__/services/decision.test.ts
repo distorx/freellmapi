@@ -64,9 +64,9 @@ describe('decision service', () => {
   });
 
   it('has adapters for the supported decision platforms', () => {
-    expect([...DECISION_PLATFORMS].sort()).toEqual(['aisense', 'apinex', 'beatapi', 'blockrun', 'cloudflare', 'custom', 'google', 'halx', 'openrouter', 'silvr']);
+    expect([...DECISION_PLATFORMS].sort()).toEqual(['aisense', 'apinex', 'beatapi', 'blockrun', 'cloudflare', 'custom', 'google', 'halx', 'ollama', 'openrouter', 'silvr']);
     // Custom endpoints are user-registered (#1777): the catalog never adds or prunes them.
-    expect([...CATALOG_DECISION_PLATFORMS].sort()).toEqual(['aisense', 'apinex', 'beatapi', 'blockrun', 'cloudflare', 'google', 'halx', 'openrouter', 'silvr']);
+    expect([...CATALOG_DECISION_PLATFORMS].sort()).toEqual(['aisense', 'apinex', 'beatapi', 'blockrun', 'cloudflare', 'google', 'halx', 'ollama', 'openrouter', 'silvr']);
   });
 
   function seed(platform: string, model: string) {
@@ -153,6 +153,29 @@ describe('decision service', () => {
     expect(out.answers).toEqual(ANSWERS);
     expect(calls(fn)[0][0]).toBe('https://openrouter.ai/api/alpha/decisions');
     expect(bodyOf(calls(fn)[0]).model).toBe('inception/mercury-decide:free');
+  });
+
+  it('calls Ollama Cloud System One with the stored key and the model id unchanged', async () => {
+    seed('ollama', 'clef:27b');
+    addKey('ollama', 'ollama-test-key');
+    const fn = mockFetch(() => json({ model: 'clef:27b', answers: ANSWERS, usage: { input_tokens: 267, output_tokens: 0 } }));
+    const out = await runDecision({ ...REQUEST, state: { messages: ['hi'] } }, { model: 'clef:27b', clientAgent: null });
+    expect(out.provider).toBe('ollama');
+    expect(out.answers).toEqual(ANSWERS);
+    expect(calls(fn)[0][0]).toBe('https://ollama.com/v1/systemone');
+    expect((calls(fn)[0][1].headers as Record<string, string>).Authorization).toBe('Bearer ollama-test-key');
+    // Object state travels as text, the shape the endpoint was tested with.
+    expect(bodyOf(calls(fn)[0])).toEqual({ model: 'clef:27b', state: '{"messages":["hi"]}', questions: REQUEST.questions });
+  });
+
+  it('rejects an Ollama answer for a different model or an option that was not offered', async () => {
+    seed('ollama', 'clef:27b');
+    addKey('ollama');
+    mockFetch(() => json({ model: 'clef:9b', answers: ANSWERS, usage: { input_tokens: 1, output_tokens: 0 } }));
+    await expect(runDecision(REQUEST, { model: 'clef:27b', clientAgent: null })).rejects.toBeInstanceOf(DecisionError);
+    clearAllCooldowns(Number.MAX_SAFE_INTEGER);
+    mockFetch(() => json({ model: 'clef:27b', answers: { tier: { type: 'choice', choice: 'heavy' } }, usage: { input_tokens: 1, output_tokens: 0 } }));
+    await expect(runDecision(REQUEST, { model: 'clef:27b', clientAgent: null })).rejects.toBeInstanceOf(DecisionError);
   });
 
   it("'auto' falls over to the next model when the first one's key is rate limited", async () => {

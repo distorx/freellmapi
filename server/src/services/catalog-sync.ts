@@ -5,7 +5,7 @@ import { getDb, getSetting, setSetting } from '../db/index.js';
 import { hasProvider } from '../providers/index.js';
 import { MEDIA_PLATFORMS, TRANSCRIPTION_PLATFORMS, VIDEO_PLATFORMS } from './media.js';
 import { SEARCH_ENGINE_PLATFORMS, SEARCH_MODALITY } from './search.js';
-import { DECISION_MODALITY, CATALOG_DECISION_PLATFORMS } from './decision.js';
+import { DECISION_MODALITY, CATALOG_DECISION_PLATFORMS, BUILTIN_DECISION_MODELS } from './decision.js';
 import { EMBEDDING_PLATFORMS } from './embeddings.js';
 import type { Platform } from '@freellmapi/shared/types.js';
 import type { Scheduler } from '../lib/scheduler.js';
@@ -481,6 +481,38 @@ export function appliedCatalogPlatforms(db: Db): Set<string> {
   }
   appliedPlatformsCache = { raw, platforms };
   return platforms;
+}
+
+function isBuiltinDecisionModel(platform: string, modelId: string): boolean {
+  return BUILTIN_DECISION_MODELS.some(m => m.platform === platform && m.modelId === modelId);
+}
+
+/**
+ * Register the decision models this binary ships by itself (see
+ * BUILTIN_DECISION_MODELS). INSERT-only: an existing row — the operator may
+ * have switched it off or the catalog may own it by now — is never touched,
+ * and a model the operator deleted stays deleted through its media tombstone.
+ * Returns how many rows were added.
+ *
+ * Called at boot (index.ts) and at the end of every catalog apply, so the row
+ * exists whether or not a catalog has ever been fetched.
+ */
+export function ensureBuiltinDecisionModels(db: Db): number {
+  const exists = db.prepare('SELECT 1 FROM media_models WHERE platform = ? AND model_id = ?');
+  const insert = db.prepare(`
+    INSERT INTO media_models (platform, model_id, display_name, modality, priority, enabled, quota_label, meta_json)
+    VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+  `);
+  let added = 0;
+  for (const m of BUILTIN_DECISION_MODELS) {
+    if (!CATALOG_DECISION_PLATFORMS.has(m.platform)) continue; // no adapter in this binary
+    if (exists.get(m.platform, m.modelId)) continue;
+    if (isCatalogModelTombstoned(db, 'media', m.platform, m.modelId)) continue;
+    const meta = typeof m.contextWindow === 'number' ? { contextWindow: m.contextWindow } : {};
+    insert.run(m.platform, m.modelId, m.displayName, DECISION_MODALITY, m.priority, m.quotaLabel, JSON.stringify(meta));
+    added++;
+  }
+  return added;
 }
 
 export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['counts']> {
@@ -1010,12 +1042,18 @@ function applyCatalogInner(db: Db, catalog: Catalog): NonNullable<SyncResult['co
         .all(DECISION_MODALITY) as { id: number; platform: string; model_id: string }[];
       for (const c of decisionCandidates) {
         if (!CATALOG_DECISION_PLATFORMS.has(c.platform)) continue;
+        // Built-in rows are this binary's, not the catalog's: a catalog that
+        // does not list them must not delete them on every sync.
+        if (isBuiltinDecisionModel(c.platform, c.model_id)) continue;
         if (!inDecisionCatalog.has(`${c.platform}:${c.model_id}`)) {
           deleteMedia.run(c.id);
           counts.removed++;
         }
       }
     }
+    // After the prune, so a first sync on a fresh install still ends with the
+    // built-in rows in place.
+    ensureBuiltinDecisionModels(db);
 
     // Prune transcription rows only when the catalog actually carries the
     // snapshot (mirrors the embeddings rule), scoped to the modality so

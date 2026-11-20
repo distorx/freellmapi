@@ -4,7 +4,7 @@ import { initDb, getDb } from './db/index.js';
 import { startHealthChecker, checkAllKeys } from './services/health.js';
 import { restoreProxySettings, flushProxyCache } from './lib/proxy.js';
 import { startWakeDetect } from './lib/wake-detect.js';
-import { startCatalogSync } from './services/catalog-sync.js';
+import { startCatalogSync, ensureBuiltinDecisionModels } from './services/catalog-sync.js';
 import { startCooldownProbe } from './services/cooldown-probe.js';
 import { startModelProbe } from './services/model-probe.js';
 import { startCustomModelSync } from './services/custom-model-sync.js';
@@ -46,6 +46,9 @@ async function main() {
     await restoreDbBackupIfNeeded();
   }
   initDb(config.dbPath ?? undefined);
+  // Decision models the binary registers itself (Ollama Cloud's clef). Before
+  // the declarative config so a config that pins one of them finds the row.
+  ensureBuiltinDecisionModels(getDb());
   applyDeclarativeConfigFromEnv();
   // After initDb: the unknown-model half of this check reads the catalog.
   warnOnRoutingOverrideDrift();

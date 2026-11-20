@@ -1,12 +1,14 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { initDb, getDb, setSetting, getSetting } from '../../db/index.js';
-import { applyCatalog, reapplyCachedCatalog, MIN_CATALOG_VERSION } from '../../services/catalog-sync.js';
+import { applyCatalog, ensureBuiltinDecisionModels, reapplyCachedCatalog, MIN_CATALOG_VERSION } from '../../services/catalog-sync.js';
+import { BUILTIN_DECISION_MODELS } from '../../services/decision.js';
 import { runMigrationsSync } from '../../db/migrate/runner.js';
 import {
   getCatalogModelTombstone,
   recordCatalogModelTombstone,
   retireCatalogModelUpstream,
   upsertModelOverrides,
+  clearCatalogModelTombstone,
 } from '../../services/model-state.js';
 
 // applyCatalog is the write path between the published catalog and the live
@@ -875,11 +877,18 @@ describe('applyCatalog: decisionModels', () => {
     return catalog;
   }
 
-  function decisionRows(): Array<{ platform: string; model_id: string; enabled: number; quota_label: string; meta_json: string | null }> {
+  type DecisionRow = { platform: string; model_id: string; enabled: number; quota_label: string; meta_json: string | null };
+  function allDecisionRows(): DecisionRow[] {
     return getDb().prepare(`
       SELECT platform, model_id, enabled, quota_label, meta_json
         FROM media_models WHERE modality = 'decision' ORDER BY priority, id
     `).all() as any;
+  }
+  // The catalog-owned rows. Built-in rows (BUILTIN_DECISION_MODELS) are seeded
+  // by every apply regardless of the registry and have their own tests below.
+  const isBuiltin = (r: DecisionRow) => BUILTIN_DECISION_MODELS.some(m => m.platform === r.platform && m.modelId === r.model_id);
+  function decisionRows(): DecisionRow[] {
+    return allDecisionRows().filter(r => !isBuiltin(r));
   }
 
   it('ships no decision models until a catalog carries the registry', () => {
@@ -919,6 +928,32 @@ describe('applyCatalog: decisionModels', () => {
     const counts = applyCatalog(getDb(), decisionCatalog(roster));
     expect(counts.skippedUnknownPlatform).toBeGreaterThanOrEqual(1);
     expect(decisionRows().map(r => r.model_id)).not.toContain('some-decider');
+  });
+
+  it('seeds the built-in decision models and never prunes them with the registry', () => {
+    const builtin = () => allDecisionRows().filter(isBuiltin).map(r => `${r.platform}:${r.model_id}`);
+    applyCatalog(getDb(), decisionCatalog(decisionRoster()));
+    expect(builtin()).toEqual(['ollama:clef:27b']);
+    // An empty registry prunes every catalog row; the built-in one is not the catalog's to delete.
+    applyCatalog(getDb(), decisionCatalog([]));
+    expect(decisionRows()).toEqual([]);
+    expect(builtin()).toEqual(['ollama:clef:27b']);
+    applyCatalog(getDb(), decisionCatalog(decisionRoster()));
+  });
+
+  it('leaves a built-in row the operator switched off or deleted alone', () => {
+    getDb().prepare("UPDATE media_models SET enabled = 0 WHERE platform = 'ollama' AND model_id = 'clef:27b'").run();
+    expect(ensureBuiltinDecisionModels(getDb())).toBe(0);
+    expect(allDecisionRows().find(isBuiltin)!.enabled).toBe(0);
+
+    getDb().prepare("DELETE FROM media_models WHERE platform = 'ollama' AND model_id = 'clef:27b'").run();
+    recordCatalogModelTombstone(getDb(), 'media', 'ollama', 'clef:27b', { source: 'user' });
+    expect(ensureBuiltinDecisionModels(getDb())).toBe(0);
+    expect(allDecisionRows().filter(isBuiltin)).toEqual([]);
+
+    clearCatalogModelTombstone(getDb(), 'media', 'ollama', 'clef:27b');
+    expect(ensureBuiltinDecisionModels(getDb())).toBe(1);
+    expect(JSON.parse(allDecisionRows().find(isBuiltin)!.meta_json!)).toEqual({ contextWindow: 65536 });
   });
 
   it('rejects a malformed decisionModels entry before applying the cached catalog', () => {

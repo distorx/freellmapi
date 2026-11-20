@@ -64,6 +64,44 @@ export interface ExtractionRequest {
 
 export const CLAIRIC_MODEL = '@cf/cloudflare/clairic';
 
+/** Ollama Cloud's System One endpoint. Decision models there (capability
+ *  `decision` on /api/show) answer only this route: /v1/chat/completions
+ *  rejects them with "is a decision model and only supports /v1/systemone". */
+export const OLLAMA_SYSTEMONE_URL = 'https://ollama.com/v1/systemone';
+
+/** A decision model this binary registers by itself, without the catalog. */
+export interface BuiltinDecisionModel {
+  platform: string;
+  modelId: string;
+  displayName: string;
+  priority: number;
+  quotaLabel: string;
+  contextWindow?: number;
+}
+
+/**
+ * Decision models the signed catalog does not carry but the operator's own key
+ * can serve. The catalog lists Ollama Cloud's free-plan chat models only, so a
+ * subscription key had no decision model to route with even though the account
+ * serves one. Rows are seeded by ensureBuiltinDecisionModels (catalog-sync) and
+ * are exempt from the catalog's decision prune; a catalog that starts listing
+ * the same platform:model simply takes the row over.
+ *
+ * Priority 1 sorts it right after Cloudflare's clef-flash (0): an install with
+ * both keeps today's first pick, and one whose Workers AI allowance is spent
+ * falls over to it inside the same 'auto' chain.
+ */
+export const BUILTIN_DECISION_MODELS: readonly BuiltinDecisionModel[] = [
+  {
+    platform: 'ollama',
+    modelId: 'clef:27b',
+    displayName: 'Clef 27B (Ollama Cloud)',
+    priority: 1,
+    quotaLabel: 'Ollama Cloud plan allowance (subscription model)',
+    contextWindow: 65536,
+  },
+];
+
 export interface DecisionResponse {
   /** The decision model that answered (its catalog id). */
   model: string;
@@ -448,6 +486,23 @@ const ADAPTERS: Record<string, Adapter> = {
     ) as { answers?: unknown; usage?: unknown; error?: { message?: string } };
     if (json?.error) throw new DecisionError(`openrouter: ${json.error.message ?? 'error'}`, 502);
     return { answers: answersOf(json?.answers, 'openrouter'), usage: usageOf(json?.usage) };
+  },
+  // Ollama Cloud speaks System One unchanged ({ model, state, questions } in,
+  // { model, answers, usage } out) on its own /v1/systemone route. Score
+  // criteria must be an array there; that is the caller's contract, so an
+  // object-shaped rubric comes back as the provider's 400 rather than being
+  // rewritten here. State is sent as text: the live-tested shape.
+  ollama: async (cred, modelId, body, signal) => {
+    const json = await upstream(OLLAMA_SYSTEMONE_URL, 'ollama', {
+      method: 'POST', redirect: 'error',
+      headers: { Authorization: `Bearer ${cred.key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: modelId,
+        state: typeof body.state === 'string' ? body.state : JSON.stringify(body.state) ?? '',
+        questions: body.questions,
+      }),
+    }, signal);
+    return checkedDecisionResult(json, 'ollama', modelId, body);
   },
   // Custom/local decision endpoint (#1777). Proposed generic contract, not a
   // maintainer-declared standard: no existing provider shares a wire shape,
