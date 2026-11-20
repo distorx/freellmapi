@@ -731,6 +731,8 @@
     "capEditHint": "मर्यादा दर महिन्याच्या 1 रोजी 00:00 UTC ला रीसेट होतात. अमर्यादसाठी रिकामे ठेवा.",
     "keyProxyLabel": "Proxy for this key",
     "keyProxyHint": "Leave blank to keep the current setting. Requests made with this key use this proxy instead of the global one; local and LAN addresses still connect directly.",
+    "paidPlanLabel": "Paid plan",
+    "paidPlanHint": "This key belongs to a paid subscription. The provider's full model list is fetched and used, not only the catalog's free models.",
     "keyProxyRemoved": "The proxy is removed when you save, and this key goes back to the global proxy.",
     "keyProxyUndo": "Undo",
     "monthlyUsageLine": "या महिन्यात {requests} विनंत्या, {tokens} टोकन",

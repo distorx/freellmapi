@@ -7,6 +7,7 @@ import { Dialog, DialogClose, DialogPopup, DialogTitle } from '@/components/ui/d
 import { FieldError } from '@/components/ui/field-error'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Switch } from '@/components/ui/switch'
 import { X } from 'lucide-react'
 import type { ApiKey } from '../../../../shared/types'
 import { useI18n } from '@/i18n'
@@ -21,6 +22,7 @@ type UpdateBody = {
   monthlyTokenCap?: number
   groupLabel?: string
   proxyUrl?: string
+  paidPlan?: boolean
 }
 
 /** Parse a budget-cap input: blank or 0 means unlimited (0); otherwise a
@@ -107,6 +109,10 @@ export function EditKeyDialog({
   // masked password can never be submitted back over the real one.
   const [proxyUrl, setProxyUrl] = useState('')
   const [clearProxy, setClearProxy] = useState(false)
+  // Paid plan: the provider's own model list is used for this key's platform,
+  // not only the catalog's free models. Custom endpoints list their own models.
+  const [paidPlan, setPaidPlan] = useState(Boolean(apiKey.paidPlan))
+  const paidPlanChanged = !isCustom && paidPlan !== Boolean(apiKey.paidPlan)
 
   const speechFlow = apiKey.platform === 'speechflow'
   const needsAccountId = speechFlow || apiKey.platform === 'cloudflare'
@@ -131,7 +137,7 @@ export function EditKeyDialog({
   const tokenCapChanged = tokenCapValue !== (apiKey.monthlyTokenCap || 0)
   const groupLabelChanged = isCustom && groupLabel.trim() !== (apiKey.groupLabel ?? '')
   const proxyChanged = Boolean(proxyUrl.trim()) || clearProxy
-  const hasChanges = label !== apiKey.label || Boolean(credential) || requestCapChanged || tokenCapChanged || groupLabelChanged || proxyChanged
+  const hasChanges = label !== apiKey.label || Boolean(credential) || requestCapChanged || tokenCapChanged || groupLabelChanged || proxyChanged || paidPlanChanged
 
   const updateKey = useMutation({
     mutationFn: (body: UpdateBody) =>
@@ -158,6 +164,7 @@ export function EditKeyDialog({
     if (groupLabelChanged) body.groupLabel = groupLabel.trim()
     // '' clears the override; a typed URL replaces it (and wins over Remove).
     if (proxyChanged) body.proxyUrl = proxyUrl.trim()
+    if (paidPlanChanged) body.paidPlan = paidPlan
     if (Object.keys(body).length > 0) updateKey.mutate(body)
     else onOpenChange(false)
   }
@@ -267,6 +274,16 @@ export function EditKeyDialog({
               {clearProxy && !proxyUrl.trim() ? t('keys.keyProxyRemoved') : t('keys.keyProxyHint')}
             </p>
           </div>
+
+          {!isCustom && (
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <Label className="text-xs" htmlFor="edit-key-paid-plan">{t('keys.paidPlanLabel')}</Label>
+                <p className="text-[11px] text-muted-foreground">{t('keys.paidPlanHint')}</p>
+              </div>
+              <Switch id="edit-key-paid-plan" size="sm" checked={paidPlan} onCheckedChange={setPaidPlan} />
+            </div>
+          )}
 
           {/* Monthly budget (#1158) stays one collapsed line; it opens by
               default only when a cap is already set, so a cap is never hidden. */}

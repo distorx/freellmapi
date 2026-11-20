@@ -243,6 +243,79 @@ describe('built-in model discovery (#1348)', () => {
     });
   });
 
+  describe('a paid-plan key', () => {
+    const flagPaid = (id: number) => getDb().prepare('UPDATE api_keys SET paid_plan = 1 WHERE id = ?').run(id);
+    // ollama is OpenAI-compatible, not allowlisted, and catalog-managed here.
+    function manageOllama(): void {
+      cacheAppliedCatalog(catalogOf([catalogModel('ollama', 'gpt-oss:20b')]));
+    }
+
+    it('makes a catalog-managed, non-allowlisted platform eligible, and only while flagged', () => {
+      manageOllama();
+      const id = addKey('ollama');
+      expect(builtinDiscoveryEligibility(getDb(), 'ollama')).toMatchObject({ eligible: false });
+      flagPaid(id);
+      expect(builtinDiscoveryEligibility(getDb(), 'ollama')).toMatchObject({ eligible: true });
+      getDb().prepare('UPDATE api_keys SET enabled = 0 WHERE id = ?').run(id);
+      expect(builtinDiscoveryEligibility(getDb(), 'ollama')).toMatchObject({ eligible: false });
+    });
+
+    it('never makes a non-OpenAI-compatible provider eligible, and off still means off', () => {
+      flagPaid(addKey('google'));
+      expect(builtinDiscoveryEligibility(getDb(), 'google')).toMatchObject({ eligible: false, reason: 'not_openai_compatible' });
+      flagPaid(addKey('ollama'));
+      process.env.BUILTIN_MODEL_DISCOVERY = 'off';
+      expect(builtinDiscoveryEligibility(getDb(), 'ollama')).toMatchObject({ eligible: false, reason: 'disabled' });
+    });
+
+    it('is discovered in MANUAL mode with the flagged key, keeping priced models and skipping non-chat ids', async () => {
+      process.env.BUILTIN_MODEL_DISCOVERY = 'manual';
+      manageOllama();
+      addKey('ollama', 'free-key');
+      flagPaid(addKey('ollama', 'pro-key'));
+      // An id the platform already serves as a decision model is not chat.
+      getDb().prepare(`
+        INSERT INTO media_models (platform, model_id, display_name, modality, priority, enabled, quota_label)
+        VALUES ('ollama', 'clef:27b', 'Clef', 'decision', 1, 1, '')
+      `).run();
+      const mock = stubModels(['glm-5.3', 'clef:27b', { id: 'kimi-k3', pricing: { prompt: '0.5', completion: '2' } }]);
+
+      const result = await runBuiltinModelDiscovery(getDb());
+
+      expect((mock.mock.calls[0]![1] as RequestInit).headers).toMatchObject({ Authorization: 'Bearer pro-key' });
+      expect(result).toMatchObject({ platforms: 1, added: 2, nonChatSkipped: 1, paidSkipped: 0 });
+      expect(rows('ollama').filter(r => r.source === 'discovered').map(r => r.model_id)).toEqual(['glm-5.3', 'kimi-k3']);
+    });
+
+    it('leaves the allowlisted platforms alone in manual mode', async () => {
+      process.env.BUILTIN_MODEL_DISCOVERY = 'manual';
+      addKey('siliconflow');
+      flagPaid(addKey('ollama'));
+      const mock = stubModels(['m']);
+      await runBuiltinModelDiscovery(getDb());
+      expect(mock).toHaveBeenCalledTimes(1);
+      expect(String(mock.mock.calls[0]![0])).toContain('ollama.com');
+      expect(rows('siliconflow')).toEqual([]);
+    });
+
+    it('keeps its discovered rows through a catalog sync that manages the platform', () => {
+      const db = getDb();
+      const id = addKey('ollama');
+      flagPaid(id);
+      registerDiscoveredModels(db, 'ollama', [{ modelId: 'glm-5.3' }], { explicit: false });
+      const baseline = (db.prepare("SELECT platform, model_id FROM models WHERE source = 'catalog'").all() as Array<{ platform: string; model_id: string }>)
+        .map(r => catalogModel(r.platform, r.model_id));
+
+      applyCatalog(db, catalogOf([...baseline, catalogModel('ollama', 'gpt-oss:20b')]));
+      expect(rows('ollama').map(r => `${r.model_id}:${r.source}`)).toContain('glm-5.3:discovered');
+
+      // Unflagged, the rows are the stopgap the catalog supersedes again.
+      db.prepare('UPDATE api_keys SET paid_plan = 0 WHERE id = ?').run(id);
+      applyCatalog(db, catalogOf([...baseline, catalogModel('ollama', 'gpt-oss:20b')]));
+      expect(rows('ollama').map(r => r.model_id)).not.toContain('glm-5.3');
+    });
+  });
+
   describe('catalog precedence on sync', () => {
     function stripCatalogRows(): AnyCatalog['models'] {
       // Keep every baseline catalog row so the apply only exercises the rows under test.

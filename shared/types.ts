@@ -435,6 +435,8 @@ export interface ApiKey {
   /** Model ids this key is limited to; null = serves every model of its
    *  platform (#657). */
   modelScope?: string[] | null;
+  /** The key is on a paid plan: its platform's own model list is used. */
+  paidPlan?: boolean;
   /** Per-key monthly request cap (0 = unlimited, #1158). */
   monthlyRequestCap?: number;
   /** Per-key monthly token cap (0 = unlimited, #1158). */
