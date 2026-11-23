@@ -1569,7 +1569,9 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
   // Fallback-v2 hedging: the loop aborts this controller (via abortInFlight)
   // when the wall-clock retry budget expires mid-attempt, canceling the
   // in-flight upstream instead of waiting for a stalled attempt to time out.
-  const hedgeAbort = new AbortController();
+  // `let`: abortInFlight aborts only the in-flight attempt and replaces the
+  // controller, so a silent-window failover gets a fresh signal (#1960).
+  let hedgeAbort = new AbortController();
   res.on('close', () => {
     if (!res.writableEnded) {
       clientGone = true;
@@ -1586,7 +1588,8 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
     attemptLog,
     logIdentity: { surface: 'legacy completions', requestId: requestGroupId, requestedModel: requestedModelLabel },
     clientGone: () => clientGone,
-    abortInFlight: () => hedgeAbort.abort(newHedgeAbortError()),
+    abortInFlight: () => { hedgeAbort.abort(newHedgeAbortError()); hedgeAbort = new AbortController(); },
+    streaming: stream === true,
     route: () => {
       // #507: see inbound-chat.ts — inflate the routing estimate from any
       // provider-reported REQUESTED size latched onto state so the existing
@@ -2562,6 +2565,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Fallback-v2 hedging: the loop aborts this controller (via abortInFlight)
   // when the wall-clock retry budget expires mid-attempt, canceling the
   // in-flight upstream instead of waiting for a stalled attempt to time out.
+  // `let`: abortInFlight aborts only the in-flight attempt and replaces the
+  // controller, so a silent-window failover gets a fresh signal (#1960).
   let hedgeAbort = new AbortController();
 
   // Decision routing (#1354): with the 'decision' strategy on, a decision
@@ -2577,10 +2582,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     attemptLog,
     logIdentity: { surface: 'chat completions', requestId: requestGroupId, requestedModel: requestedModelLabel },
     clientGone: () => clientGone,
-    abortInFlight: () => hedgeAbort.abort(newHedgeAbortError()),
-    // Stall failover: an aborted signal stays aborted, so each abandoned
-    // attempt is followed by a fresh controller. Both dispatch paths compose
-    // their fetch signal from `hedgeAbort` at call time, so they pick it up.
+    abortInFlight: () => { hedgeAbort.abort(newHedgeAbortError()); hedgeAbort = new AbortController(); },
+    // Ours: opts this surface in to the stall failover timeout. abortInFlight
+    // above already renews the controller (#1960), so this only has to exist;
+    // renewing once more before the next attempt is harmless.
     renewInFlightAbort: () => { hedgeAbort = new AbortController(); },
     streaming: stream === true,
     route: () => {

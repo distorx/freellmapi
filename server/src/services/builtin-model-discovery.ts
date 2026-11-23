@@ -281,7 +281,7 @@ export function autoRegistrable(
   let nonChat = 0;
   let paid = 0;
   for (const model of models) {
-    if (model.kind !== undefined || (platform === 'ovh' && specialistTask(model.id))) { nonChat += 1; continue; }
+    if (model.kind !== undefined || specialistTask(model.id, platform)) { nonChat += 1; continue; }
     // An id the platform already serves as a decision, embedding or media
     // model is not a chat model, whatever its name looks like.
     if (options.nonChatIds?.has(model.id)) { nonChat += 1; continue; }
